@@ -1,0 +1,7 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+1. Call cargo check after some amount of work and fix errors
+2. Call cargo run with logs at the end of responce and if something wrong fix errors

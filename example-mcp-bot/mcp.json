@@ -1,0 +1,16 @@
+{
+    "mcpServers": {
+      "rust-mcp-from-scratch": {
+        "command": "/home/coolman/real-mcp/mcp-server-from-scratch/target/debug/examples/simple_server",
+        "args": [],
+        "env": {
+          "MCP_LOG": "1"
+        }
+      },
+      "shit": {
+        "command": "python3",
+        "args": ["/home/coolman/cursor-fuck/custom_mcp_server.py"],
+        "env": {}
+      }
+    }
+  }
