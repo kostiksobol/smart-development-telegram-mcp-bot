@@ -1,0 +1,1 @@
+@curdtest_bot
