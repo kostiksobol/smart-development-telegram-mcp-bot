@@ -617,7 +617,7 @@ async fn text_handler(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<()
 
     // Handle confirmation button presses
     if text == "✅ Yes, execute tools" || text == "❌ No, cancel" {
-        return handle_tool_execution(bot, chat_id, state, text == "✅ Yes, execute tools").await;
+        return handle_tool_confirmation(bot, chat_id, state, text == "✅ Yes, execute tools").await;
     }
 
     bot.send_chat_action(chat_id, ChatAction::Typing).await?;
@@ -629,24 +629,11 @@ async fn text_handler(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<()
         let global_servers = state.global_mcp_servers.lock().await;
         create_openai_tools(&global_servers, user_session)
     };
-    
-    // Tools should never be empty since system tools are always available
 
-    let mut messages: Vec<ChatCompletionRequestMessage> = vec![
+    // Start a new conversation unit with system message and user's prompt
+    let messages: Vec<ChatCompletionRequestMessage> = vec![
         ChatCompletionRequestSystemMessage {
-            content: "You are a friendly Telegram assistant with MCP server management tools. 
-
-IMPORTANT: When users say 'add [server_name]' or 'add server [name]' or similar, ALWAYS use system_add_server_to_my_list immediately with the server name. Do NOT list servers first.
-
-Tool usage:
-- ADD/ENABLE a server (e.g. 'add shit', 'add server shit'): use system_add_server_to_my_list with server_name
-- REMOVE/DISABLE a server: use system_remove_server_from_my_list  
-- LIST available servers: use system_list_available_servers
-- LIST their active servers: use system_list_my_servers
-- ACTIVATE/ENABLE a tool: use system_activate_tool_for_my_server
-- DEACTIVATE/DISABLE a tool: use system_deactivate_tool_for_my_server
-
-Be casual and use emojis.".to_string(),
+            content: "You are a friendly Telegram assistant with access to MCP server management tools. Be casual and use emojis.".to_string(),
             role: Role::System,
             name: None,
         }.into(),
@@ -657,7 +644,20 @@ Be casual and use emojis.".to_string(),
         }.into()
     ];
 
+    // Process the conversation
+    process_conversation(bot, chat_id, state, messages, tools).await
+}
+
+// Process a conversation with potential tool calls
+async fn process_conversation(
+    bot: Bot,
+    chat_id: ChatId,
+    state: Arc<AppState>,
+    mut messages: Vec<ChatCompletionRequestMessage>,
+    tools: Vec<ChatCompletionTool>,
+) -> Result<()> {
     loop {
+        // Send request to OpenAI
         let request = async_openai::types::CreateChatCompletionRequestArgs::default()
             .model("gpt-4o")
             .messages(messages.clone())
@@ -665,11 +665,13 @@ Be casual and use emojis.".to_string(),
             .tool_choice(ChatCompletionToolChoiceOption::Auto)
             .build()?;
 
-        info!("Sending request to OpenAI...");
         let response = state.openai_client.chat().create(request).await?;
         let choice = response.choices.get(0).context("No choice from OpenAI")?;
         let response_message = &choice.message;
+        
 
+
+        // Add assistant's response to messages
         messages.push(
             ChatCompletionRequestAssistantMessage {
                 content: response_message.content.clone(),
@@ -681,10 +683,62 @@ Be casual and use emojis.".to_string(),
             .into(),
         );
 
-        let tool_calls = if let Some(tc) = &response_message.tool_calls {
-            tc.clone()
+        // Check if there are tool calls
+        if let Some(tool_calls) = &response_message.tool_calls {
+            // Show tool confirmation dialog
+            let tool_descriptions: Vec<String> = tool_calls.iter().map(|tc| {
+                let (server_name, tool_name) = if tc.function.name.starts_with("system_") {
+                    ("system", &tc.function.name[7..])
+                } else {
+                    let parts: Vec<&str> = tc.function.name.splitn(2, '_').collect();
+                    (*parts.get(0).unwrap_or(&"unknown"), *parts.get(1).unwrap_or(&"unknown"))
+                };
+                
+                let args_display = match serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
+                    Ok(args) => {
+                        match serde_json::to_string_pretty(&args) {
+                            Ok(pretty_json) => format!("\n<pre><code>{}</code></pre>", pretty_json),
+                            Err(_) => format!("\n<code>{}</code>", tc.function.arguments)
+                        }
+                    },
+                    Err(_) => format!("\n<code>{}</code>", tc.function.arguments)
+                };
+                
+                format!("🔧 <b>{}</b> from <i>{}</i> server{}", tool_name, server_name, args_display)
+            }).collect();
+
+            let confirmation_text = format!(
+                "I'd like to execute the following tools to help you:\n\n{}\n\nWould you like me to proceed?",
+                tool_descriptions.join("\n\n")
+            );
+
+            let keyboard = KeyboardMarkup::new(vec![
+                vec![
+                    KeyboardButton::new("✅ Yes, execute tools"),
+                    KeyboardButton::new("❌ No, cancel"),
+                ]
+            ])
+            .resize_keyboard(true)
+            .one_time_keyboard(true);
+
+            // Store pending state
+            {
+                let mut pending = state.pending_tool_calls.lock().await;
+                pending.insert(chat_id, PendingToolExecution {
+                    messages: messages.clone(),
+                    tool_calls: tool_calls.clone(),
+                });
+            }
+
+            bot.send_message(chat_id, confirmation_text)
+                .reply_markup(keyboard)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .await?;
+            
+            // Exit and wait for user confirmation
+            break;
         } else {
-            // No tool calls, we have a final answer
+            // No tool calls - send final response and end conversation
             if let Some(content) = &response_message.content {
                 let formatted_content = format_for_telegram(content);
                 bot.send_message(chat_id, formatted_content)
@@ -696,67 +750,15 @@ Be casual and use emojis.".to_string(),
                     .reply_markup(KeyboardRemove::new())
                     .await?;
             }
-            break; // Exit loop
-        };
-
-        // Ask user for confirmation before executing tools
-        let tool_descriptions: Vec<String> = tool_calls.iter().map(|tc| {
-            let (server_name, tool_name) = if tc.function.name.starts_with("system_") {
-                ("system", &tc.function.name[7..]) // Remove "system_" prefix
-            } else {
-                let parts: Vec<&str> = tc.function.name.splitn(2, '_').collect();
-                (*parts.get(0).unwrap_or(&"unknown"), *parts.get(1).unwrap_or(&"unknown"))
-            };
-            
-            // Parse and format the arguments nicely
-            let args_display = match serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
-                Ok(args) => {
-                    match serde_json::to_string_pretty(&args) {
-                        Ok(pretty_json) => format!("\n<pre><code>{}</code></pre>", pretty_json),
-                        Err(_) => format!("\n<code>{}</code>", tc.function.arguments)
-                    }
-                },
-                Err(_) => format!("\n<code>{}</code>", tc.function.arguments)
-            };
-            
-            format!("🔧 <b>{}</b> from <i>{}</i> server{}", tool_name, server_name, args_display)
-        }).collect();
-
-        let confirmation_text = format!(
-            "I'd like to execute the following tools to help you:\n\n{}\n\nWould you like me to proceed?",
-            tool_descriptions.join("\n\n")
-        );
-
-        let keyboard = KeyboardMarkup::new(vec![
-            vec![
-                KeyboardButton::new("✅ Yes, execute tools"),
-                KeyboardButton::new("❌ No, cancel"),
-            ]
-        ])
-        .resize_keyboard(true)
-        .one_time_keyboard(true);
-
-        // Store the pending tool calls
-        {
-            let mut pending = state.pending_tool_calls.lock().await;
-            pending.insert(chat_id, PendingToolExecution {
-                messages: messages.clone(),
-                tool_calls: tool_calls.clone(),
-            });
+            break;
         }
-
-        bot.send_message(chat_id, confirmation_text)
-            .reply_markup(keyboard)
-            .parse_mode(teloxide::types::ParseMode::Html)
-            .await?;
-
-        break; // Wait for user response
     }
 
     Ok(())
 }
 
-async fn handle_tool_execution(bot: Bot, chat_id: ChatId, state: Arc<AppState>, execute: bool) -> Result<()> {
+// Handle tool execution confirmation
+async fn handle_tool_confirmation(bot: Bot, chat_id: ChatId, state: Arc<AppState>, execute: bool) -> Result<()> {
     let pending = {
         let mut pending_map = state.pending_tool_calls.lock().await;
         pending_map.remove(&chat_id)
@@ -770,14 +772,13 @@ async fn handle_tool_execution(bot: Bot, chat_id: ChatId, state: Arc<AppState>, 
             bot.send_chat_action(chat_id, ChatAction::Typing).await?;
 
             let mut messages = pending_execution.messages;
+            let tool_calls = pending_execution.tool_calls;
 
+            // Execute all tools in parallel
             let mut tool_futures = Vec::new();
-            for tool_call in pending_execution.tool_calls {
+            for tool_call in tool_calls {
                 let function = tool_call.function.clone();
-                info!(
-                    "Model wants to call tool: {}({})",
-                    function.name, function.arguments
-                );
+                info!("Executing tool: {}({})", function.name, function.arguments);
 
                 let state_clone = state.clone();
                 let chat_id_clone = chat_id;
@@ -852,6 +853,7 @@ async fn handle_tool_execution(bot: Bot, chat_id: ChatId, state: Arc<AppState>, 
 
             let tool_results = join_all(tool_futures).await;
 
+            // Add tool results to messages
             for result in tool_results {
                 let (tool_call_id, tool_execution_result) = result?;
 
@@ -873,23 +875,16 @@ async fn handle_tool_execution(bot: Bot, chat_id: ChatId, state: Arc<AppState>, 
                 );
             }
 
-            // Get final response from OpenAI
-            let request = async_openai::types::CreateChatCompletionRequestArgs::default()
-                .model("gpt-4o")
-                .messages(messages)
-                .build()?;
+            // Get updated tools for the next iteration
+            let tools = {
+                let mut user_sessions = state.user_sessions.lock().await;
+                let user_session = user_sessions.entry(chat_id).or_default();
+                let global_servers = state.global_mcp_servers.lock().await;
+                create_openai_tools(&global_servers, user_session)
+            };
 
-            let response = state.openai_client.chat().create(request).await?;
-            let choice = response.choices.get(0).context("No choice from OpenAI")?;
-
-            if let Some(content) = &choice.message.content {
-                let formatted_content = format_for_telegram(content);
-                bot.send_message(chat_id, formatted_content)
-                    .parse_mode(teloxide::types::ParseMode::Html)
-                    .await?;
-            } else {
-                bot.send_message(chat_id, "✅ Tools executed successfully!").await?;
-            }
+            // Continue the conversation with tool results
+            process_conversation(bot, chat_id, state, messages, tools).await?;
         } else {
             bot.send_message(chat_id, "❌ Tool execution cancelled. How else can I help you?")
                 .reply_markup(KeyboardRemove::new())
@@ -903,6 +898,8 @@ async fn handle_tool_execution(bot: Bot, chat_id: ChatId, state: Arc<AppState>, 
 
     Ok(())
 }
+
+
 
 // --- System Tool Execution Functions ---
 
